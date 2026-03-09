@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GrayCode Camera Scanner</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    video { width: 100%; max-height: 70vh; background: #111; border-radius: 12px; object-fit: cover; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; }
+    button { padding: 10px 12px; font-size: 16px; }
+    .status { padding: 10px 12px; background: #f3f4f6; border-radius: 12px; }
+    .hint { color:#444; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>그레이 코드 실시간 인식</h2>
+    <p class="hint">코드를 화면 중앙에 크게 맞추면 자동으로 이동합니다.</p>
+
+    <div class="row">
+      <button id="start">카메라 시작</button>
+      <button id="stop" disabled>카메라 정지</button>
+    </div>
+
+    <div class="status" id="status">대기 중…</div>
+
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+  </div>
+
+<script>
+(() => {
+  // ===== 10x10 =====
+  const N = 10;
+
+  // ===== 2개 패턴 → 2개 URL 매핑 =====
+  // - 1번: 3레벨(0/1/2) => [0,128,255]
+  // - 2번: 4레벨(0/1/2/3) => [0,85,170,255]
+  const PATTERNS = [
+    {
+      id: "NPL_HOME",
+      url: "https://npl.khu.ac.kr/",
+      levelToGray: [0, 128, 255],
+      levels: [
+        [1,2,0,0,1,1,0,0,0,0],
+        [2,1,1,1,2,0,0,2,0,2],
+        [2,0,2,1,2,2,2,2,2,1],
+        [2,1,1,0,1,1,2,1,0,2],
+        [1,1,1,2,1,2,1,1,2,2],
+        [0,0,1,0,1,2,2,1,1,0],
+        [2,0,0,1,2,0,1,1,1,0],
+        [2,1,0,2,1,1,2,0,0,2],
+        [0,0,0,2,2,0,1,1,1,1],
+        [2,2,0,2,2,0,1,1,0,0]
+      ]
+    },
+    {
+      id: "OSK_CFR136",
+      url: "https://www.osk.or.kr/conference/event/index.php?cfrid=136",
+      levelToGray: [0, 85, 170, 255],
+      levels: [
+        [2,0,2,0,0,0,3,2,2,0],
+        [0,3,0,2,2,3,1,3,2,3],
+        [1,3,2,3,0,1,1,0,3,2],
+        [0,0,1,1,1,3,0,3,1,1],
+        [0,1,2,0,2,3,0,3,3,3],
+        [0,2,1,1,2,0,3,3,1,0],
+        [0,3,2,3,0,2,0,1,2,0],
+        [2,0,0,2,3,0,0,0,1,1],
+        [0,2,3,3,3,0,2,3,2,2],
+        [2,2,2,1,1,3,2,3,2,2]
+      ]
+    }
+  ];
+
+  // ===== 튜닝 =====
+  const SCAN_INTERVAL_MS = 140;
+  const RMSE_THRESHOLD = 80;     // 필요하면 낮추면(엄격), 올리면(관대)
+  // 패턴별 levelToGray를 사용하므로 전역 LEVEL_TO_GRAY는 사용 안 함
+
+  // 사각형 검출용 다운샘플 크기(속도/정확도 타협)
+  const DET_W = 480;
+  const DET_H = 480;
+
+  // 원근 보정 결과 정사각형 크기
+  const WARP_SIZE = 300;
+
+  // ===== 회전/템플릿 =====
+  function rotate90(m) {
+    const out = Array.from({length:N}, () => Array(N).fill(0));
+    for (let r=0;r<N;r++) for (let c=0;c<N;c++) out[c][N-1-r] = m[r][c];
+    return out;
+  }
+
+  function levelsToTargetVec(levels2d, levelToGray) {
+    const v = new Float32Array(N*N);
+    let k = 0;
+    for (let r=0;r<N;r++) for (let c=0;c<N;c++) v[k++] = levelToGray[levels2d[r][c]];
+    return v;
+  }
+
+  const ROT_PATTERNS = PATTERNS.map(p => {
+    const r0 = p.levels;
+    const r1 = rotate90(r0);
+    const r2 = rotate90(r1);
+    const r3 = rotate90(r2);
+    return {
+      id: p.id, url: p.url,
+      targets: [
+        levelsToTargetVec(r0, p.levelToGray),
+        levelsToTargetVec(r1, p.levelToGray),
+        levelsToTargetVec(r2, p.levelToGray),
+        levelsToTargetVec(r3, p.levelToGray)
+      ]
+    };
+  });
+
+  const statusEl = document.getElementById("status");
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("canvas");
+  const btnStart = document.getElementById("start");
+  const btnStop  = document.getElementById("stop");
+
+  video.style.objectFit = "cover";
+
+  // 내부 캔버스들
+  const detCanvas = document.createElement("canvas");
+  detCanvas.width = DET_W; detCanvas.height = DET_H;
+  const detCtx = detCanvas.getContext("2d", { willReadFrequently: true });
+
+  const warpCanvas = document.createElement("canvas");
+  warpCanvas.width = WARP_SIZE; warpCanvas.height = WARP_SIZE;
+  const warpCtx = warpCanvas.getContext("2d", { willReadFrequently: true });
+
+  let stream = null;
+  let timer = null;
+  let opened = false;
+  let okStreak = 0;
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  // ===== 기본 유틸 =====
+  function rgbToGray(r, g, b) {
+    return 0.299*r + 0.587*g + 0.114*b;
+  }
+
+  // ROI를 detCanvas로 가져오기(영상 전체를 정사각형으로 crop 후 다운샘플)
+  function captureToDetCanvas() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return false;
+
+    // 영상에서 중앙 정사각형 crop → DET_W×DET_H
+    const s = Math.min(vw, vh);
+    const sx = Math.floor((vw - s)/2);
+    const sy = Math.floor((vh - s)/2);
+    detCtx.drawImage(video, sx, sy, s, s, 0, 0, DET_W, DET_H);
+    return true;
+  }
+
+  // ===== 에지 계산(소벨) =====
+  function sobelEdges(gray, w, h) {
+    const mag = new Float32Array(w*h);
+    const idx = (x,y)=>y*w+x;
+    for (let y=1;y<h-1;y++) {
+      for (let x=1;x<w-1;x++) {
+        const gx =
+          -gray[idx(x-1,y-1)] + gray[idx(x+1,y-1)] +
+          -2*gray[idx(x-1,y)]   + 2*gray[idx(x+1,y)] +
+          -gray[idx(x-1,y+1)] + gray[idx(x+1,y+1)];
+        const gy =
+          -gray[idx(x-1,y-1)] -2*gray[idx(x,y-1)] -gray[idx(x+1,y-1)] +
+           gray[idx(x-1,y+1)] +2*gray[idx(x,y+1)] +gray[idx(x+1,y+1)];
+        mag[idx(x,y)] = Math.abs(gx) + Math.abs(gy);
+      }
+    }
+    return mag;
+  }
+
+  // ===== 사각형 4점 추정(간단) =====
+  function estimateQuadFromEdges(mag, w, h) {
+    // 임계값: 상위 퍼센타일 기반(자동)
+    const arr = Array.from(mag);
+    arr.sort((a,b)=>a-b);
+    const thr = arr[Math.floor(arr.length*0.92)] || 0; // 상위 8%
+    if (thr <= 0) return null;
+
+    let tl=null,tr=null,br=null,bl=null;
+    let bestTL=Infinity, bestTR=Infinity, bestBR=-Infinity, bestBL=-Infinity;
+
+    for (let y=0;y<h;y++) {
+      for (let x=0;x<w;x++) {
+        const m = mag[y*w+x];
+        if (m < thr) continue;
+
+        const s1 = x + y;
+        const s2 = -x + y;
+
+        if (s1 < bestTL) { bestTL = s1; tl = {x,y}; }
+        if (s2 < bestTR) { bestTR = s2; tr = {x,y}; }
+        if (s1 > bestBR) { bestBR = s1; br = {x,y}; }
+        if (s2 > bestBL) { bestBL = s2; bl = {x,y}; }
+      }
+    }
+
+    if (!tl || !tr || !br || !bl) return null;
+
+    // 너무 작은 영역이면 실패 처리
+    const areaApprox = Math.abs((br.x-tl.x)*(br.y-tl.y));
+    if (areaApprox < (w*h*0.02)) return null;
+
+    return [tl,tr,br,bl];
+  }
+
+  // ===== 호모그래피/원근 보정 =====
+  function computeHomography(src, dst) {
+    // 8x8 선형방정식 풀기 (가우스 소거)
+    // H는 h33=1로 두고 8개 미지수
+    const A = [];
+    const b = [];
+    for (let i=0;i<4;i++) {
+      const x = src[i].x, y = src[i].y;
+      const u = dst[i].x, v = dst[i].y;
+      A.push([x,y,1, 0,0,0, -u*x, -u*y]); b.push(u);
+      A.push([0,0,0, x,y,1, -v*x, -v*y]); b.push(v);
+    }
+    // 가우스 소거
+    const n = 8;
+    for (let col=0; col<n; col++) {
+      // pivot
+      let pivot = col;
+      for (let r=col+1;r<n;r++) if (Math.abs(A[r][col]) > Math.abs(A[pivot][col])) pivot = r;
+      [A[col], A[pivot]] = [A[pivot], A[col]];
+      [b[col], b[pivot]] = [b[pivot], b[col]];
+
+      const div = A[col][col];
+      if (Math.abs(div) < 1e-9) return null;
+      for (let c=col;c<n;c++) A[col][c] /= div;
+      b[col] /= div;
+
+      for (let r=0;r<n;r++) {
+        if (r===col) continue;
+        const factor = A[r][col];
+        for (let c=col;c<n;c++) A[r][c] -= factor*A[col][c];
+        b[r] -= factor*b[col];
+      }
+    }
+    const h = b; // [h11,h12,h13,h21,h22,h23,h31,h32], h33=1
+    return [
+      [h[0],h[1],h[2]],
+      [h[3],h[4],h[5]],
+      [h[6],h[7],1]
+    ];
+  }
+
+  function invert3x3(M) {
+    const a=M[0][0], b=M[0][1], c=M[0][2];
+    const d=M[1][0], e=M[1][1], f=M[1][2];
+    const g=M[2][0], h=M[2][1], i=M[2][2];
+    const A = e*i - f*h;
+    const B = -(d*i - f*g);
+    const C = d*h - e*g;
+    const D = -(b*i - c*h);
+    const E = a*i - c*g;
+    const F = -(a*h - b*g);
+    const G = b*f - c*e;
+    const H = -(a*f - c*d);
+    const I = a*e - b*d;
+    const det = a*A + b*B + c*C;
+    if (Math.abs(det) < 1e-9) return null;
+    const invDet = 1/det;
+    return [
+      [A*invDet, D*invDet, G*invDet],
+      [B*invDet, E*invDet, H*invDet],
+      [C*invDet, F*invDet, I*invDet]
+    ];
+  }
+
+  function applyH(H, x, y) {
+    const nx = H[0][0]*x + H[0][1]*y + H[0][2];
+    const ny = H[1][0]*x + H[1][1]*y + H[1][2];
+    const nz = H[2][0]*x + H[2][1]*y + H[2][2];
+    return { x: nx/nz, y: ny/nz };
+  }
+
+  function warpFromDetCanvas(quad) {
+    // detCanvas 좌표계에서 quad -> dst(0..WARP_SIZE)
+    const dst = [
+      {x:0, y:0},
+      {x:WARP_SIZE-1, y:0},
+      {x:WARP_SIZE-1, y:WARP_SIZE-1},
+      {x:0, y:WARP_SIZE-1},
+    ];
+    const H = computeHomography(quad, dst);
+    if (!H) return null;
+    const Hinv = invert3x3(H);
+    if (!Hinv) return null;
+
+    const srcImg = detCtx.getImageData(0,0,DET_W,DET_H);
+    const sdata = srcImg.data;
+
+    const out = warpCtx.createImageData(WARP_SIZE, WARP_SIZE);
+    const odata = out.data;
+
+    for (let y=0;y<WARP_SIZE;y++) {
+      for (let x=0;x<WARP_SIZE;x++) {
+        // dst(x,y) -> src(u,v)
+        const p = applyH(Hinv, x, y);
+        const u = Math.max(0, Math.min(DET_W-1, p.x));
+        const v = Math.max(0, Math.min(DET_H-1, p.y));
+        const uu = Math.floor(u), vv = Math.floor(v);
+        const idx = (vv*DET_W + uu)*4;
+
+        const odx = (y*WARP_SIZE + x)*4;
+        odata[odx]   = sdata[idx];
+        odata[odx+1] = sdata[idx+1];
+        odata[odx+2] = sdata[idx+2];
+        odata[odx+3] = 255;
+      }
+    }
+    warpCtx.putImageData(out, 0, 0);
+    return out; // ImageData
+  }
+
+  // ===== NxN 추출 + 매칭 =====
+  function cellMeanGray(imgData, W, r, c, cell) {
+    const { data } = imgData;
+
+    // 셀 내부만 샘플: 경계 섞임 방지 (20% 마진)
+    const margin = Math.max(1, Math.floor(cell * 0.20));
+    const x0 = c * cell + margin;
+    const y0 = r * cell + margin;
+    const x1 = (c + 1) * cell - margin;
+    const y1 = (r + 1) * cell - margin;
+
+    const vals = [];
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const idx = (y * W + x) * 4;
+        vals.push(rgbToGray(data[idx], data[idx + 1], data[idx + 2]));
+      }
+    }
+
+    // 트림 평균
+    vals.sort((a,b)=>a-b);
+    const cut = Math.floor(vals.length * 0.10);
+    const slice = vals.slice(cut, vals.length - cut);
+    let sum = 0;
+    for (const v of slice) sum += v;
+    return sum / slice.length;
+  }
+
+  function extractGrayVecFromWarp(imgData) {
+    const W = WARP_SIZE;
+    const cell = Math.floor(W / N);
+    const v = new Float32Array(N*N);
+    let k=0;
+    for (let r=0;r<N;r++) {
+      for (let c=0;c<N;c++) {
+        v[k++] = cellMeanGray(imgData, W, r, c, cell);
+      }
+    }
+    return v;
+  }
+
+  function rmseWithAffineFit(obs, target) {
+    const n = obs.length;
+    let meanO=0, meanT=0;
+    for (let i=0;i<n;i++) { meanO += obs[i]; meanT += target[i]; }
+    meanO/=n; meanT/=n;
+
+    let varO=0, cov=0;
+    for (let i=0;i<n;i++) {
+      const xo=obs[i]-meanO;
+      const yt=target[i]-meanT;
+      varO += xo*xo;
+      cov  += xo*yt;
+    }
+    if (varO < 1e-6) return Infinity;
+    const a = cov/varO;
+    if (a < 0) return Infinity;
+    const b = meanT - a*meanO;
+
+    let mse=0;
+    for (let i=0;i<n;i++) {
+      const diff = (a*obs[i] + b) - target[i];
+      mse += diff*diff;
+    }
+    return Math.sqrt(mse/n);
+  }
+
+  function passesContrastGate(obs) {
+    const n=obs.length;
+    let mean=0;
+    for (let i=0;i<n;i++) mean += obs[i];
+    mean/=n;
+    let v=0;
+    for (let i=0;i<n;i++) { const d=obs[i]-mean; v += d*d; }
+    v/=n;
+    return Math.sqrt(v) >= 18;
+  }
+
+  function scanFrameOnce() {
+    if (!captureToDetCanvas()) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
+
+    // detCanvas 픽셀 → gray
+    const img = detCtx.getImageData(0,0,DET_W,DET_H);
+    const gray = new Float32Array(DET_W*DET_H);
+    for (let i=0, p=0; i<img.data.length; i+=4, p++) {
+      gray[p] = rgbToGray(img.data[i], img.data[i+1], img.data[i+2]);
+    }
+
+    // edge
+    const mag = sobelEdges(gray, DET_W, DET_H);
+
+    // quad 추정
+    const quad = estimateQuadFromEdges(mag, DET_W, DET_H);
+    if (!quad) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
+
+    // warp
+    const warped = warpFromDetCanvas(quad);
+    if (!warped) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
+
+    // NxN 추출
+    const obs = extractGrayVecFromWarp(warped);
+    if (!passesContrastGate(obs)) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
+
+    // 템플릿 매칭
+    let best = Infinity, bestId=null, bestUrl=null;
+    for (const p of ROT_PATTERNS) {
+      for (const t of p.targets) {
+        const s = rmseWithAffineFit(obs, t);
+        if (s < best) { best = s; bestId=p.id; bestUrl=p.url; }
+      }
+    }
+    return { best, ok: best <= RMSE_THRESHOLD, bestId, bestUrl };
+  }
+
+  function loop() {
+    if (opened) return;
+
+    const res = scanFrameOnce();
+    if (res.ok) okStreak++;
+    else okStreak = Math.max(0, okStreak - 1);
+
+    setStatus("스캔 중…");
+
+    if (okStreak >= 3 && res.bestUrl) {
+      opened = true;
+      setStatus(`인식 성공(${res.bestId})! 이동합니다…`);
+      window.location.href = res.bestUrl;
+    }
+  }
+
+  async function startCamera() {
+    opened = false;
+    okStreak = 0;
+    setStatus("카메라 권한 요청 중…");
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+
+      await new Promise(resolve => {
+        if (video.readyState >= 2) resolve();
+        else video.onloadedmetadata = () => resolve();
+      });
+
+      setStatus("스캔 시작! (자동으로 사각형을 찾습니다)");
+      timer = setInterval(loop, SCAN_INTERVAL_MS);
+    } catch (err) {
+      setStatus("카메라 시작 실패: " + err);
+    }
+  }
+
+  function stopCamera() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    setStatus("카메라 정지됨.");
+  }
+
+  btnStart.addEventListener("click", startCamera);
+  btnStop.addEventListener("click", stopCamera);
+
+  if (location.protocol !== "https:" && location.hostname !== "localhost") {
+    setStatus("주의: 카메라는 HTTPS에서만 동작합니다. GitHub Pages로 배포하세요.");
+  }
+})();
+</script>
+</body>
+</html>
