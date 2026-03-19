@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -16,15 +16,15 @@
 </head>
 <body>
   <div class="wrap">
-    <h2>그레이 코드 실시간 인식</h2>
-    <p class="hint">코드를 화면 중앙에 크게 맞추면 자동으로 이동합니다.</p>
+    <h2>Real-Time Gray Code Detection</h2>
+    <p class="hint">Align the code large and centered on the screen for automatic navigation.</p>
 
     <div class="row">
-      <button id="start">카메라 시작</button>
-      <button id="stop" disabled>카메라 정지</button>
+      <button id="start">Start Camera</button>
+      <button id="stop" disabled>Stop Camera</button>
     </div>
 
-    <div class="status" id="status">대기 중…</div>
+    <div class="status" id="status">Waiting...</div>
 
     <video id="video" playsinline autoplay muted></video>
     <canvas id="canvas" style="display:none;"></canvas>
@@ -35,9 +35,9 @@
   // ===== 10x10 =====
   const N = 10;
 
-  // ===== 2개 패턴 → 2개 URL 매핑 =====
-  // - 1번: 3레벨(0/1/2) => [0,128,255]
-  // - 2번: 4레벨(0/1/2/3) => [0,85,170,255]
+  // ===== Map 2 patterns -> 2 URLs =====
+  // - Pattern 1: 3 levels (0/1/2) => [0,128,255]
+  // - Pattern 2: 4 levels (0/1/2/3) => [0,85,170,255]
   const PATTERNS = [
     {
       id: "OSK_CFR136",
@@ -76,19 +76,19 @@
     }
   ];
 
-  // ===== 튜닝 =====
+  // ===== Tuning =====
   const SCAN_INTERVAL_MS = 140;
-  const RMSE_THRESHOLD = 80;     // 필요하면 낮추면(엄격), 올리면(관대)
-  // 패턴별 levelToGray를 사용하므로 전역 LEVEL_TO_GRAY는 사용 안 함
+  const RMSE_THRESHOLD = 80;     // Lower = stricter, higher = more lenient
+  // Use per-pattern levelToGray, so no global LEVEL_TO_GRAY is needed
 
-  // 사각형 검출용 다운샘플 크기(속도/정확도 타협)
+  // Downsample size for rectangle detection (speed/accuracy tradeoff)
   const DET_W = 480;
   const DET_H = 480;
 
-  // 원근 보정 결과 정사각형 크기
+  // Output square size after perspective correction
   const WARP_SIZE = 300;
 
-  // ===== 회전/템플릿 =====
+  // ===== Rotation / template =====
   function rotate90(m) {
     const out = Array.from({length:N}, () => Array(N).fill(0));
     for (let r=0;r<N;r++) for (let c=0;c<N;c++) out[c][N-1-r] = m[r][c];
@@ -126,7 +126,7 @@
 
   video.style.objectFit = "cover";
 
-  // 내부 캔버스들
+  // Internal canvases
   const detCanvas = document.createElement("canvas");
   detCanvas.width = DET_W; detCanvas.height = DET_H;
   const detCtx = detCanvas.getContext("2d", { willReadFrequently: true });
@@ -142,17 +142,17 @@
 
   function setStatus(msg) { statusEl.textContent = msg; }
 
-  // ===== 기본 유틸 =====
+  // ===== Basic utilities =====
   function rgbToGray(r, g, b) {
     return 0.299*r + 0.587*g + 0.114*b;
   }
 
-  // ROI를 detCanvas로 가져오기(영상 전체를 정사각형으로 crop 후 다운샘플)
+  // Capture ROI to detCanvas
+  // Crop the whole video to a square, then downsample
   function captureToDetCanvas() {
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return false;
 
-    // 영상에서 중앙 정사각형 crop → DET_W×DET_H
     const s = Math.min(vw, vh);
     const sx = Math.floor((vw - s)/2);
     const sy = Math.floor((vh - s)/2);
@@ -160,7 +160,7 @@
     return true;
   }
 
-  // ===== 에지 계산(소벨) =====
+  // ===== Edge detection (Sobel) =====
   function sobelEdges(gray, w, h) {
     const mag = new Float32Array(w*h);
     const idx = (x,y)=>y*w+x;
@@ -179,12 +179,12 @@
     return mag;
   }
 
-  // ===== 사각형 4점 추정(간단) =====
+  // ===== Estimate 4 corners of a rectangle (simple) =====
   function estimateQuadFromEdges(mag, w, h) {
-    // 임계값: 상위 퍼센타일 기반(자동)
+    // Threshold based on top percentile
     const arr = Array.from(mag);
     arr.sort((a,b)=>a-b);
-    const thr = arr[Math.floor(arr.length*0.92)] || 0; // 상위 8%
+    const thr = arr[Math.floor(arr.length*0.92)] || 0;
     if (thr <= 0) return null;
 
     let tl=null,tr=null,br=null,bl=null;
@@ -207,17 +207,14 @@
 
     if (!tl || !tr || !br || !bl) return null;
 
-    // 너무 작은 영역이면 실패 처리
     const areaApprox = Math.abs((br.x-tl.x)*(br.y-tl.y));
     if (areaApprox < (w*h*0.02)) return null;
 
     return [tl,tr,br,bl];
   }
 
-  // ===== 호모그래피/원근 보정 =====
+  // ===== Homography / perspective warp =====
   function computeHomography(src, dst) {
-    // 8x8 선형방정식 풀기 (가우스 소거)
-    // H는 h33=1로 두고 8개 미지수
     const A = [];
     const b = [];
     for (let i=0;i<4;i++) {
@@ -226,10 +223,9 @@
       A.push([x,y,1, 0,0,0, -u*x, -u*y]); b.push(u);
       A.push([0,0,0, x,y,1, -v*x, -v*y]); b.push(v);
     }
-    // 가우스 소거
+
     const n = 8;
     for (let col=0; col<n; col++) {
-      // pivot
       let pivot = col;
       for (let r=col+1;r<n;r++) if (Math.abs(A[r][col]) > Math.abs(A[pivot][col])) pivot = r;
       [A[col], A[pivot]] = [A[pivot], A[col]];
@@ -247,7 +243,7 @@
         b[r] -= factor*b[col];
       }
     }
-    const h = b; // [h11,h12,h13,h21,h22,h23,h31,h32], h33=1
+    const h = b;
     return [
       [h[0],h[1],h[2]],
       [h[3],h[4],h[5]],
@@ -286,7 +282,6 @@
   }
 
   function warpFromDetCanvas(quad) {
-    // detCanvas 좌표계에서 quad -> dst(0..WARP_SIZE)
     const dst = [
       {x:0, y:0},
       {x:WARP_SIZE-1, y:0},
@@ -306,7 +301,6 @@
 
     for (let y=0;y<WARP_SIZE;y++) {
       for (let x=0;x<WARP_SIZE;x++) {
-        // dst(x,y) -> src(u,v)
         const p = applyH(Hinv, x, y);
         const u = Math.max(0, Math.min(DET_W-1, p.x));
         const v = Math.max(0, Math.min(DET_H-1, p.y));
@@ -321,14 +315,13 @@
       }
     }
     warpCtx.putImageData(out, 0, 0);
-    return out; // ImageData
+    return out;
   }
 
-  // ===== NxN 추출 + 매칭 =====
+  // ===== Extract NxN + matching =====
   function cellMeanGray(imgData, W, r, c, cell) {
     const { data } = imgData;
 
-    // 셀 내부만 샘플: 경계 섞임 방지 (20% 마진)
     const margin = Math.max(1, Math.floor(cell * 0.20));
     const x0 = c * cell + margin;
     const y0 = r * cell + margin;
@@ -343,7 +336,6 @@
       }
     }
 
-    // 트림 평균
     vals.sort((a,b)=>a-b);
     const cut = Math.floor(vals.length * 0.10);
     const slice = vals.slice(cut, vals.length - cut);
@@ -405,29 +397,23 @@
   function scanFrameOnce() {
     if (!captureToDetCanvas()) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
-    // detCanvas 픽셀 → gray
     const img = detCtx.getImageData(0,0,DET_W,DET_H);
     const gray = new Float32Array(DET_W*DET_H);
     for (let i=0, p=0; i<img.data.length; i+=4, p++) {
       gray[p] = rgbToGray(img.data[i], img.data[i+1], img.data[i+2]);
     }
 
-    // edge
     const mag = sobelEdges(gray, DET_W, DET_H);
 
-    // quad 추정
     const quad = estimateQuadFromEdges(mag, DET_W, DET_H);
     if (!quad) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
-    // warp
     const warped = warpFromDetCanvas(quad);
     if (!warped) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
-    // NxN 추출
     const obs = extractGrayVecFromWarp(warped);
     if (!passesContrastGate(obs)) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
-    // 템플릿 매칭
     let best = Infinity, bestId=null, bestUrl=null;
     for (const p of ROT_PATTERNS) {
       for (const t of p.targets) {
@@ -445,11 +431,11 @@
     if (res.ok) okStreak++;
     else okStreak = Math.max(0, okStreak - 1);
 
-    setStatus("스캔 중…");
+    setStatus("Scanning...");
 
     if (okStreak >= 3 && res.bestUrl) {
       opened = true;
-      setStatus(`인식 성공(${res.bestId})! 이동합니다…`);
+      setStatus(`Recognition successful (${res.bestId})! Redirecting...`);
       window.location.href = res.bestUrl;
     }
   }
@@ -457,7 +443,7 @@
   async function startCamera() {
     opened = false;
     okStreak = 0;
-    setStatus("카메라 권한 요청 중…");
+    setStatus("Requesting camera permission...");
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -473,10 +459,10 @@
         else video.onloadedmetadata = () => resolve();
       });
 
-      setStatus("스캔 시작! (자동으로 사각형을 찾습니다)");
+      setStatus("Scan started! Automatically detecting the square pattern.");
       timer = setInterval(loop, SCAN_INTERVAL_MS);
     } catch (err) {
-      setStatus("카메라 시작 실패: " + err);
+      setStatus("Failed to start camera: " + err);
     }
   }
 
@@ -485,14 +471,14 @@
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     btnStart.disabled = false;
     btnStop.disabled = true;
-    setStatus("카메라 정지됨.");
+    setStatus("Camera stopped.");
   }
 
   btnStart.addEventListener("click", startCamera);
   btnStop.addEventListener("click", stopCamera);
 
   if (location.protocol !== "https:" && location.hostname !== "localhost") {
-    setStatus("주의: 카메라는 HTTPS에서만 동작합니다. GitHub Pages로 배포하세요.");
+    setStatus("Warning: Camera access only works over HTTPS. Please deploy with GitHub Pages.");
   }
 })();
 </script>
